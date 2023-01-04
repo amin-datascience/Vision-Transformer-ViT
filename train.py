@@ -1,177 +1,138 @@
 import torch
 import torch.nn as nn
+from torchvision import datasets
+from torchvision import transforms
+from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import matplotlib.pyplot as plt
 
-class PatchEmbedding(nn.Module):
+import warmup_scheduler
+import numpy as np
 
-	def __init__(self, img_size, patch_size, embed_dim, in_channels = 3, early_cnn = True):
-		super(PatchEmbedding, self).__init__() 
-		self.img_size = img_size 
-		self.patch_size = patch_size 
-		self.n_patches = (img_size // patch_size) ** 2
-		self.early_cnn = early_cnn
+
+def train_func(data, model, optimizer, loss_func, max_epochs = 50, validation_loader = None, 
+               batch_size = 128, scheduler = None, device = None):
 
-		self.cnn = nn.Conv2d(in_channels = in_channels, out_channels = 3, kernel_size = 3, padding = 1)
-		self.bn = nn.BatchNorm2d(3)
-		self.relu = nn.ReLU()
-		self.transform = nn.Conv2d(in_channels = in_channels, out_channels = embed_dim, 
-								   kernel_size = patch_size, stride = patch_size) 
 
+    n_batches_train = len(train_loader)
+    n_batches_val = len(validation_loader)
+    n_samples_train = batch_size * n_batches_train
+    n_samples_val = batch_size * n_batches_val
 
-	def forward(self, x):
 
-		#(n, 3, 32, 32) doesn't change the size ofthe image
-		if self.early_cnn :
-			x = self.cnn(x)  
-		x = self.bn(x)
-		x = self.relu(x)
+    losses = []
+    accuracy = []
+    validation_loss = []
+    validation_accuracy = []
+    
 
-		x = self.transform(x) #(n_samples, embed_dim, width, height)
-		x = x.flatten(2)
-		x = x.transpose(1, 2) #(n_samples, n_patches, embed_dim)
+    for epoch in range(max_epochs):
+        running_loss, correct = 0, 0
+        for images, labels in train_loader:
+            if device:
+                images = images.to(device)
+                labels = labels.to(device)
 
-		return x
+            model.train()
+            outputs = model(images)[0]
+            loss = loss_func(outputs, labels)
+            predictions = outputs.argmax(1)
+            correct += int(sum(predictions == labels))
+            running_loss += loss.item()
 
 
+            #BACKWARD AND OPTIMZIE
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+        
+        loss_epoch = running_loss / n_batches_train
+        accuracy_epoch = correct / n_samples_train
 
-class SelfAttention(nn.Module):
-    def __init__(self, dim, n_heads = 8, proj_drop = 0.1):
+                 
+        losses.append(loss_epoch)
+        accuracy.append(accuracy_epoch)
+        
+        print('Epoch [{}/{}], Training Accuracy [{:.4f}], Training Loss: {:.4f},'
+             .format(epoch + 1, max_epochs, accuracy_epoch, loss_epoch), end = '  ')
+        print('Correct/ Total: [{}/{}]'.format(correct, n_samples_train), end = '   ')
+        
+        if validation_loader:
+            model.eval()     
+                       
+            val_loss, val_corr = 0, 0
+            for val_images, val_labels in validation_loader:
+                if device:
+                    val_images = val_images.to(device)
+                    val_labels = val_labels.to(device)
 
-	super(SelfAttention, self).__init__()
-	self.dim = dim 
-	self.n_heads = n_heads 
-	self.head_dim = dim // n_heads 
-	self.scale = n_heads ** -0.5
+                outputs = model(val_images)[0]
+                loss = loss_func(outputs, val_labels)
+                _, predictions = outputs.max(1)
+                val_corr += int(sum(predictions == val_labels))
+                val_loss += loss.item()
 
-	self.query = nn.Linear(dim, dim)
-	self.key = nn.Linear(dim, dim)
-	self.value = nn.Linear(dim, dim)
-	self.fc_out = nn.Linear(dim, dim)
-	self.fc_drop = nn.Dropout(proj_drop)
 
+            loss_val = val_loss / n_batches_val
+            accuracy_val = val_corr / n_samples_val
 
+            validation_loss.append(loss_val)
+            validation_accuracy.append(accuracy_val)
 
-    def forward(self, x):
-	n_samples, n_patches, dim = x.shape	
 
-	assert dim == self.dim, 'dim should be equal to the dimension declared in the constructor'
+            print('Validation accuracy [{:.4f}], Validation Loss: {:.4f}'
+                 .format(accuracy_val, loss_val))
 
-	q = self.query(x)  #Each with dim: (n_samples, n_patches + 1, dim)
-	k = self.key(x)
-	v = self.value(x)
 
+    model_save_name = 'vit.pt'
+    path = F'./{model_save_name}'
+    torch.save(model.state_dict(), path)
 
-	q = q.reshape(n_samples, n_patches, self.n_heads, self.head_dim) #(n_samples, n_patches, self.n_heads, self.head_dim)
-	k = k.reshape(n_samples, n_patches, self.n_heads, self.head_dim)      
-	v = v.reshape(n_samples, n_patches, self.n_heads, self.head_dim)
+    
 
-	q = q.permute(0, 2, 1, 3) #(n_samples, n_heads, n_patches, head_dim)
-	k = k.permute(0, 2, 1, 3)
-	v = v.permute(0, 2, 1, 3)
+    return {'loss': losses, 'accuracy': accuracy, 
+            'val_loss': validation_loss, 'val_accuracy': validation_accuracy}
 
-	k_t = k.transpose(-1, -2) #(n_samples, n_heads, head_dim, n_patches)
 
-	weights = (torch.matmul(q, k_t)) * self.scale #(n_samples, n_heads, n_patches, n_patches)
+train_transform = transforms.Compose([
+    transforms.TrivialAugmentWide(interpolation = transforms.InterpolationMode.BILINEAR),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding = 4),
+    transforms.PILToTensor(),
+    transforms.ConvertImageDtype(torch.float),
+    transforms.RandomErasing(p=0.1)])
 
-	scores = weights.softmax(dim = -1)
 
-	weighted_avg = scores @ v  #(n_smples, n_heads, n_patches, head_dim)
-	weighted_avg = weighted_avg.transpose(1, 2) #(n_smples, n_patches, n_heads, head_dim)
 
-	weighted_avg = weighted_avg.flatten(2) #(n_samples, n_patches, n_heads*head_dim)
+#Running the code
+path = './'
+cifar10 = datasets.CIFAR10(path, train = True, download = True, 
+                                       transform = train_transform)
 
-	x = self.fc_out(weighted_avg)
-	x = self.fc_drop(x) #checked
+cifar10_test = datasets.CIFAR10(path, train = False, download = True,
+                                            transform = transforms.Compose([transforms.ToTensor()]))
 
-	return x 
 
+validation, test = torch.utils.data.random_split(cifar10_test, [2000, 8000])
+concat = torch.utils.data.ConcatDataset([cifar10, test])
 
+train_loader = torch.utils.data.DataLoader(concat, batch_size = 128, shuffle = True, drop_last = True, num_workers = 2)
+val_loader = torch.utils.data.DataLoader(validation, batch_size = 128, shuffle = True, drop_last = True, num_workers = 2) 
 
-class MLP(nn.Module):
 
-    def __init__(self, in_features, out_features, drop_mlp):
-	super(MLP, self).__init__()
+#Defining the model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
 
-	self.fc1 = nn.Linear(in_features, out_features)
-	self.dropout = nn.Dropout(drop_mlp)
-	self.fc2 = nn.Linear(out_features, out_features)
-	self.gelu = nn.GELU()
+criterion = nn.CrossEntropyLoss(label_smoothing = 0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3, weight_decay = 4e-4)
 
 
-    def forward(self, x):
-	x = self.fc1(x)  #(n_samples, n_patches, hidden_features)
-	x = self.gelu(x)
-	x = self.dropout(x)
-	x = self.fc2(x)
-	#x = self.gelu(x)  Why NOT???? IN paper
-	x = self.dropout(x)
+base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = 100, eta_min = 1e-4)
+scheduler = warmup_scheduler.GradualWarmupScheduler(optimizer, multiplier=1., total_epoch=5, after_scheduler = base_scheduler)
 
-	return x 
+history = train_func(train_loader, model, optimizer, loss_func = criterion, validation_loader = val_loader, 
+                     device = device, scheduler = scheduler, batch_size = 128, max_epochs = 100)
 
-
-
-class Block(nn.Module):
-
-    def __init__(self,  dim, n_heads, p_drop = 0.1):
-	super(Block, self).__init__()
-
-	self.norm1 = nn.LayerNorm(dim)
-	self.norm2 = nn.LayerNorm(dim)
-	self.attention = SelfAttention(dim = dim, n_heads = n_heads)	 
-
-	self.mlp = MLP(in_features = dim, out_features = dim, drop_mlp = p_drop)
-
-
-
-    def forward(self, x):
-	x = x + self.attention(self.norm1(x))
-	x = x + self.mlp(self.norm2(x))
-
-	return x   
-
-
-
-
-class ViT(nn.Module):
-
-    def __init__(self, img_size, patch_size = 16, in_channels = 3, n_classes = 10, embed_dim = 768, 
-		layers = 6, n_heads = 12, p_drop = 0, early_cnn = True):
-	super(ViT, self).__init__()
-
-	self.patch_embed = PatchEmbedding(img_size = img_size, patch_size = patch_size, embed_dim = embed_dim, early_cnn = early_cnn)
-	self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-	self.pos_embed = nn.Parameter(torch.randn(1, 1 + self.patch_embed.n_patches, embed_dim)) 
-
-
-	self.pos_drop = nn.Dropout(p_drop)
-
-	self.blocks = nn.ModuleList([
-	    Block(dim = embed_dim, n_heads = n_heads, p_drop = p_drop)
-		    for _ in range(layers)])
-
-	self.norm = nn.LayerNorm(embed_dim)
-	self.head = nn.Linear(in_features = embed_dim, out_features = n_classes)
-
-
-
-
-    def forward(self, x):
-	n_samples = x.shape[0]
-
-	x = self.patch_embed(x) #(n_samples, n_pathces, embed_dim)
-
-	cls_token = self.cls_token.expand(n_samples, -1, -1) #(n_samples, 1, embed_dim)
-
-	x = torch.cat([cls_token, x], dim = 1) #(n_samples, 1+n_patches, embed_dim)
-	x = x + self.pos_embed	
-	x = self.pos_drop(x)
-
-	for block in self.blocks:
-	    x = block(x) 
-
-	x = self.norm(x) 
-
-	output = x[:, 0]
-	x = self.head(output)
-
-	return x
 
