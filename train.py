@@ -1,200 +1,177 @@
-import torch 
-import torch.nn as nn 
+import torch
+import torch.nn as nn
 
+class PatchEmbedding(nn.Module):
 
+	def __init__(self, img_size, patch_size, embed_dim, in_channels = 3, early_cnn = True):
+		super(PatchEmbedding, self).__init__() 
+		self.img_size = img_size 
+		self.patch_size = patch_size 
+		self.n_patches = (img_size // patch_size) ** 2
+		self.early_cnn = early_cnn
 
-def train_func(train_loader, model, optimizer, loss_func, max_epochs = 20, validation_loader = None, 
-			   batch_size = 64, scheduler = None, device = None, test = None):
+		self.cnn = nn.Conv2d(in_channels = in_channels, out_channels = 3, kernel_size = 3, padding = 1)
+		self.bn = nn.BatchNorm2d(3)
+		self.relu = nn.ReLU()
+		self.transform = nn.Conv2d(in_channels = in_channels, out_channels = embed_dim, 
+								   kernel_size = patch_size, stride = patch_size) 
 
-	''' 
-	This function takes raw data as input and converst it to data loader itself.
-	Also, it does apply the model on the test data if test data is given. 
 
-	'''
+	def forward(self, x):
 
+		#(n, 3, 32, 32) doesn't change the size ofthe image
+		if self.early_cnn :
+			x = self.cnn(x)  
+		x = self.bn(x)
+		x = self.relu(x)
 
-	'''validation, test = torch.utils.data.random_split(val_data, [2000, 8000])
-			
-				train_loader = torch.utils.data.DataLoader(transformed_cifar10, batch_size = batch_size, shuffle = True, drop_last = True)
-				val_loader = torch.utils.data.DataLoader(validation, batch_size = batch_size, shuffle = True, drop_last = True) '''
+		x = self.transform(x) #(n_samples, embed_dim, width, height)
+		x = x.flatten(2)
+		x = x.transpose(1, 2) #(n_samples, n_patches, embed_dim)
 
+		return x
 
-	n_batches_train = len(train_loader)
-	n_batches_val = len(validation_loader)
-	n_samples_train = batch_size * n_batches_train
-	n_samples_val = batch_size * n_batches_val
 
 
-	losses = []
-	accuracy = []
-	validation_loss = []
-	validation_accuracy = []
+class SelfAttention(nn.Module):
+    def __init__(self, dim, n_heads = 8, proj_drop = 0.1):
 
+	super(SelfAttention, self).__init__()
+	self.dim = dim 
+	self.n_heads = n_heads 
+	self.head_dim = dim // n_heads 
+	self.scale = n_heads ** -0.5
 
-	for epoch in range(max_epochs):
-		running_loss, correct = 0, 0
-		for images, labels in train_loader:
-			if device:
-				images = images.to(device)
-				labels = labels.to(device)
+	self.query = nn.Linear(dim, dim)
+	self.key = nn.Linear(dim, dim)
+	self.value = nn.Linear(dim, dim)
+	self.fc_out = nn.Linear(dim, dim)
+	self.fc_drop = nn.Dropout(proj_drop)
 
-			model.train()
-			outputs = model(images)
-			loss = loss_func(outputs, labels)
-			predictions = outputs.argmax(1)
-			correct += int(sum(predictions == labels))
-			running_loss += loss.item()
 
 
-			#BACKWARD AND OPTIMZIE
-			optimizer.zero_grad()
-			loss.backward()
-			optimizer.step()
+    def forward(self, x):
+	n_samples, n_patches, dim = x.shape	
 
+	assert dim == self.dim, 'dim should be equal to the dimension declared in the constructor'
 
-		loss_epoch = running_loss / n_batches_train
-		accuracy_epoch = correct / n_samples_train
-		scheduler.step(loss_epoch)
+	q = self.query(x)  #Each with dim: (n_samples, n_patches + 1, dim)
+	k = self.key(x)
+	v = self.value(x)
 
-		losses.append(loss_epoch)
-		accuracy.append(accuracy_epoch)
 
-		print('Epoch [{}/{}], Training Accuracy [{:.4f}], Training Loss: {:.4f}'
-            .format(epoch + 1, max_epochs, accuracy_epoch, loss_epoch), end = '  ')
- 		print('Correct/ Total: [{}/{}]'.format(correct, n_samples_train), end = '   ')
+	q = q.reshape(n_samples, n_patches, self.n_heads, self.head_dim) #(n_samples, n_patches, self.n_heads, self.head_dim)
+	k = k.reshape(n_samples, n_patches, self.n_heads, self.head_dim)      
+	v = v.reshape(n_samples, n_patches, self.n_heads, self.head_dim)
 
-        if validation_loader:
-            model.eval()     
-                       
-            val_loss, val_corr = 0, 0
-            for val_images, val_labels in validation_loader:
-                if device:
-                    val_images = val_images.to(device)
-                    val_labels = val_labels.to(device)
+	q = q.permute(0, 2, 1, 3) #(n_samples, n_heads, n_patches, head_dim)
+	k = k.permute(0, 2, 1, 3)
+	v = v.permute(0, 2, 1, 3)
 
-                outputs = model(val_images)
-                loss = loss_func(outputs, val_labels)
-                _, predictions = outputs.max(1)
-                val_corr += int(sum(predictions == val_labels))
-                val_loss += loss.item()
+	k_t = k.transpose(-1, -2) #(n_samples, n_heads, head_dim, n_patches)
 
+	weights = (torch.matmul(q, k_t)) * self.scale #(n_samples, n_heads, n_patches, n_patches)
 
-            loss_val = val_loss / n_batches_val
-            accuracy_val = val_corr / n_samples_val
+	scores = weights.softmax(dim = -1)
 
-			validation_loss.append(loss_val)
-			validation_accuracy.append(accuracy_val)
+	weighted_avg = scores @ v  #(n_smples, n_heads, n_patches, head_dim)
+	weighted_avg = weighted_avg.transpose(1, 2) #(n_smples, n_patches, n_heads, head_dim)
 
+	weighted_avg = weighted_avg.flatten(2) #(n_samples, n_patches, n_heads*head_dim)
 
-			print('Validation accuracy [{:.4f}], Validation Loss: {:.4f}'
-                 .format(accuracy_val, loss_val))
+	x = self.fc_out(weighted_avg)
+	x = self.fc_drop(x) #checked
 
+	return x 
 
-	if test:
-		
-		test_loader = torch.utils.data.DataLoader(test, batch_size = 64, shuffle= True, drop_last = True)   
-		correct = 0
-		total = 0
 
-		for images, labels in test_loader:
-			if device:
-				images = images.to(device)
-				labels = labels.to(device)
 
-			n_data = images[0]
-			total += n_data
-			outputs = model(images)
-			predictions = outputs.argmax(1)
-			correct += int(sum(predictions == labels))
+class MLP(nn.Module):
 
-		accuracy = correct / total 
-		print('Test Accuracy: {}'.format(accuracy))
+    def __init__(self, in_features, out_features, drop_mlp):
+	super(MLP, self).__init__()
 
+	self.fc1 = nn.Linear(in_features, out_features)
+	self.dropout = nn.Dropout(drop_mlp)
+	self.fc2 = nn.Linear(out_features, out_features)
+	self.gelu = nn.GELU()
 
-	model_save_name = 'vit.pt'
-	path = F"/content/gdrive/My Drive/{model_save_name}" 
-	torch.save(model.state_dict(), path)
 
-    
+    def forward(self, x):
+	x = self.fc1(x)  #(n_samples, n_patches, hidden_features)
+	x = self.gelu(x)
+	x = self.dropout(x)
+	x = self.fc2(x)
+	#x = self.gelu(x)  Why NOT???? IN paper
+	x = self.dropout(x)
 
-    return {'loss': losses, 'accuracy': accuracy, 
-            'val_loss': validation_loss, 'val_accuracy': validation_accuracy}
+	return x 
 
 
 
+class Block(nn.Module):
 
-def test_func(test_loader, model, device = None):
-	'''
-	Eliminated--> Ino bordam toye function train.
-	'''
-	correct = 0
-	total = 0
+    def __init__(self,  dim, n_heads, p_drop = 0.1):
+	super(Block, self).__init__()
 
-	for images, labels in test_loader:
-		if device:
-			images = images.to(device)
-			labels = labels.to(device)
+	self.norm1 = nn.LayerNorm(dim)
+	self.norm2 = nn.LayerNorm(dim)
+	self.attention = SelfAttention(dim = dim, n_heads = n_heads)	 
 
-		n_data = images.shape[0]
-		total += n_data
-		outputs = model(images)
-		predictions = outputs.argmax(1)
-		correct += int(sum(predictions == labels))
+	self.mlp = MLP(in_features = dim, out_features = dim, drop_mlp = p_drop)
 
 
-	accuracy = correct / total 
-	print('Test Accuracy: {}'.format(accuracy))
 
-	return accuracy
+    def forward(self, x):
+	x = x + self.attention(self.norm1(x))
+	x = x + self.mlp(self.norm2(x))
 
+	return x   
 
 
 
-def count_params(model):
-	'''Returns the number of parameters of a model'''
 
-	return sum([params.numel() for params in model.parameters() if params.requires_grad == True])
+class ViT(nn.Module):
 
+    def __init__(self, img_size, patch_size = 16, in_channels = 3, n_classes = 10, embed_dim = 768, 
+		layers = 6, n_heads = 12, p_drop = 0, early_cnn = True):
+	super(ViT, self).__init__()
 
+	self.patch_embed = PatchEmbedding(img_size = img_size, patch_size = patch_size, embed_dim = embed_dim, early_cnn = early_cnn)
+	self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+	self.pos_embed = nn.Parameter(torch.randn(1, 1 + self.patch_embed.n_patches, embed_dim)) 
 
-if __name__ == '__main__'
 
-	# NORMALIZING OUR DATA
-	imgs = torch.stack([img for img, _ in cifar10_tensor], dim = 3)
-	mean = imgs.view(3, -1).mean(dim = 1)
-	std = imgs.view(3, -1).std(dim = 1)
+	self.pos_drop = nn.Dropout(p_drop)
 
+	self.blocks = nn.ModuleList([
+	    Block(dim = embed_dim, n_heads = n_heads, p_drop = p_drop)
+		    for _ in range(layers)])
 
-	transformed_cifar10 = datasets.CIFAR10(path, train = True, 
-	                                       transform = transforms.Compose([transforms.ToTensor(), 
-	                                                                       transforms.Normalize(mean, std)]))
-	transformed_cifar10_test = datasets.CIFAR10(path, train = False, 
-	                                            transform = transforms.Compose([transforms.ToTensor(), 
-	                                                                            transforms.Normalize(mean, std)]))	
+	self.norm = nn.LayerNorm(embed_dim)
+	self.head = nn.Linear(in_features = embed_dim, out_features = n_classes)
 
 
-	validation, test = torch.utils.data.random_split(transformed_cifar10_test, [2000, 8000])
 
 
-	train_loader = torch.utils.data.DataLoader(transformed_cifar10, batch_size = 64, shuffle = True, drop_last = True)
-	test_loader = torch.utils.data.DataLoader(test, batch_size = 64, shuffle= True, drop_last = True)   
-	val_loader = torch.utils.data.DataLoader(validation, batch_size = 64, shuffle = True, drop_last = True) 
+    def forward(self, x):
+	n_samples = x.shape[0]
 
+	x = self.patch_embed(x) #(n_samples, n_pathces, embed_dim)
 
-	device = torch.device('cuda' if torch.cuda_is_available() else 'cpu')
-	model = ViT().to(device)
-	criterion = nn.CrossEntropyLoss()
-	optimizer = torch.optim.Adam(model.parameters(), lr = 0.001, weight_decay = 1e-4)
-	scheduler = ReduceLROnPlateau(optimizer, 'min')
-	history = train_func(train_loader, model, optimizer, loss_func = criterion)
+	cls_token = self.cls_token.expand(n_samples, -1, -1) #(n_samples, 1, embed_dim)
 
-	test_accuracy = test_func(test_loader, model)
+	x = torch.cat([cls_token, x], dim = 1) #(n_samples, 1+n_patches, embed_dim)
+	x = x + self.pos_embed	
+	x = self.pos_drop(x)
 
+	for block in self.blocks:
+	    x = block(x) 
 
+	x = self.norm(x) 
 
+	output = x[:, 0]
+	x = self.head(output)
 
-
-
-
-
+	return x
 
